@@ -1,44 +1,221 @@
-using System;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Interop;
-using System.Windows.Input;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
 
 namespace NexusIsland;
+
 public partial class MainWindow : Window
 {
- const int GWL_EXSTYLE=-20, WS_EX_TRANSPARENT=0x20, WS_EX_LAYERED=0x80000, HOTKEY_ID=0x4E58;
- const uint MOD_ALT=1, MOD_CONTROL=2, VK_I=0x49;
- readonly DispatcherTimer clock=new(){Interval=TimeSpan.FromSeconds(1)};
- readonly DispatcherTimer pointer=new(){Interval=TimeSpan.FromMilliseconds(120)};
- HwndSource? source; IntPtr hwnd; bool passThrough=true, expanded=false;
- public MainWindow(){InitializeComponent();clock.Tick+=(_,_)=>UpdateClock();pointer.Tick+=(_,_)=>CheckPointer();UpdateClock();}
- void Window_Loaded(object sender,RoutedEventArgs e){Left=(SystemParameters.PrimaryScreenWidth-Width)/2;Top=0;hwnd=new WindowInteropHelper(this).Handle;source=HwndSource.FromHwnd(hwnd);source?.AddHook(WndProc);RegisterHotKey(hwnd,HOTKEY_ID,MOD_CONTROL|MOD_ALT,VK_I);clock.Start();pointer.Start();ApplyMode();}
- void UpdateClock(){var n=DateTime.Now;TimeText.Text=n.ToString("HH:mm");DateText.Text=n.ToString("ddd, d MMM",CultureInfo.GetCultureInfo("ru-RU"));LanguageText.Text=GetLayout();}
- static string GetLayout(){var w=GetForegroundWindow();var tid=GetWindowThreadProcessId(w,out _);var id=(int)(GetKeyboardLayout(tid).ToInt64()&0xffff);return id switch{0x0419=>"RU",0x0409=>"EN",_=>id.ToString("X4")};}
- void CheckPointer(){if(hwnd==IntPtr.Zero)return;GetCursorPos(out var p);var r=new RECT();if(!GetWindowRect(hwnd,ref r))return;bool over=p.X>=r.Left&&p.X<r.Right&&p.Y>=r.Top&&p.Y<r.Bottom;Opacity=passThrough&&over?0.38:1.0;if(!passThrough&&over&&!expanded)Expand();if(!over&&expanded)CollapsePanel();}
- void ApplyMode(){long s=GetWindowLongPtr(hwnd,GWL_EXSTYLE).ToInt64();s|=WS_EX_LAYERED;if(passThrough)s|=WS_EX_TRANSPARENT;else s&=~(long)WS_EX_TRANSPARENT;SetWindowLongPtr(hwnd,GWL_EXSTYLE,new IntPtr(s));ModeText.Text=passThrough?"Сквозной режим включён — клики проходят сквозь остров":"Режим управления — остров принимает клики";}
- void ToggleMode(){passThrough=!passThrough;ApplyMode();Opacity=1;}
- void Toggle_Click(object sender,RoutedEventArgs e)=>ToggleMode();
- void Collapse_Click(object sender,RoutedEventArgs e)=>CollapsePanel();
- void Exit_Click(object sender,RoutedEventArgs e)=>Close();
- void Expand(){expanded=true;ExpandedPanel.Visibility=Visibility.Visible;AnimateHeight(158);}
- void CollapsePanel(){if(!expanded)return;expanded=false;AnimateHeight(54);ExpandedPanel.Visibility=Visibility.Collapsed;}
- void AnimateHeight(double h)=>BeginAnimation(HeightProperty,new DoubleAnimation(h,TimeSpan.FromMilliseconds(220)){EasingFunction=new QuadraticEase{EasingMode=EasingMode.EaseOut}});
- IntPtr WndProc(IntPtr h,int m,IntPtr wp,IntPtr lp,ref bool handled){if(m==0x312&&wp.ToInt32()==HOTKEY_ID){ToggleMode();handled=true;}return IntPtr.Zero;}
- void Window_Closing(object? s,System.ComponentModel.CancelEventArgs e){clock.Stop();pointer.Stop();if(hwnd!=IntPtr.Zero)UnregisterHotKey(hwnd,HOTKEY_ID);source?.RemoveHook(WndProc);}
- [StructLayout(LayoutKind.Sequential)] struct POINT{public int X,Y;}
- [StructLayout(LayoutKind.Sequential)] struct RECT{public int Left,Top,Right,Bottom;}
- [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
- [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h,ref RECT r);
- [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
- [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);
- [DllImport("user32.dll")] static extern IntPtr GetKeyboardLayout(uint id);
- [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h,int id,uint mod,uint key);
- [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h,int id);
- [DllImport("user32.dll",EntryPoint="GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h,int i);
- [DllImport("user32.dll",EntryPoint="SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h,int i,IntPtr v);
+    private readonly DispatcherTimer _clockTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private readonly DispatcherTimer _pointerTimer = new() { Interval = TimeSpan.FromMilliseconds(70) };
+    private readonly DispatcherTimer _systemTimer = new() { Interval = TimeSpan.FromSeconds(2) };
+    private bool _expanded;
+    private IntPtr _handle;
+    private bool _passThrough;
+    private ulong _lastIdle, _lastKernel, _lastUser;
+    private double _cpuUsage;
+    private const int GwlExStyle = -20;
+    private const int WsExTransparent = 0x20;
+    private const int WsExToolWindow = 0x80;
+    private const int WsExNoActivate = 0x08000000;
+
+    public MainWindow()
+    {
+        InitializeComponent();
+        _clockTimer.Tick += (_, _) => UpdateClock();
+        _pointerTimer.Tick += (_, _) => UpdatePointerMode();
+        _systemTimer.Tick += (_, _) => UpdateSystemInfo();
+    }
+
+    private void Window_Loaded(object sender, RoutedEventArgs e)
+    {
+        _handle = new WindowInteropHelper(this).Handle;
+        Left = (SystemParameters.PrimaryScreenWidth - Width) / 2;
+        Top = 0;
+        int style = GetWindowLong(_handle, GwlExStyle);
+        SetWindowLong(_handle, GwlExStyle, style | WsExToolWindow | WsExNoActivate);
+        UpdateClock();
+        UpdateSystemInfo();
+        LoadNote();
+        _clockTimer.Start();
+        _pointerTimer.Start();
+        _systemTimer.Start();
+    }
+
+    private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        _clockTimer.Stop(); _pointerTimer.Stop(); _systemTimer.Stop();
+    }
+
+    private void UpdateClock()
+    {
+        DateTime now = DateTime.Now;
+        ClockText.Text = now.ToString("HH:mm");
+        DayText.Text = now.ToString("dddd", new CultureInfo("ru-RU")).ToUpper(new CultureInfo("ru-RU"));
+        DateText.Text = now.ToString("d MMMM", new CultureInfo("ru-RU")).ToUpper(new CultureInfo("ru-RU"));
+        FullDateText.Text = now.ToString("dddd, d MMMM yyyy", new CultureInfo("ru-RU"));
+        string lang = GetActiveKeyboardLanguage();
+        LanguageText.Text = lang;
+        FullLanguageText.Text = lang == "RU" ? "RU — Русский" : lang == "EN" ? "EN — English" : lang;
+    }
+
+    private static string GetActiveKeyboardLanguage()
+    {
+        IntPtr foreground = GetForegroundWindow();
+        uint thread = GetWindowThreadProcessId(foreground, out _);
+        IntPtr layout = GetKeyboardLayout(thread);
+        int id = unchecked((int)(long)layout) & 0xFFFF;
+        return id switch { 0x0419 => "RU", 0x0409 or 0x0809 or 0x0C09 => "EN", _ => id.ToString("X4") };
+    }
+
+    private void ExpandButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_expanded) CollapseIsland(); else ExpandIsland();
+    }
+
+    private void ExpandIsland()
+    {
+        _expanded = true;
+        _passThrough = false;
+        ApplyTransparentStyle(false);
+        ExpandButton.Content = "⌃";
+        Dashboard.Visibility = Visibility.Visible;
+        var height = new DoubleAnimation(54, 660, TimeSpan.FromMilliseconds(300)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } };
+        BeginAnimation(HeightProperty, height);
+        Dashboard.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(220)));
+        IslandShell.Opacity = 1;
+        UpdateSystemInfo();
+    }
+
+    private void CollapseIsland()
+    {
+        _expanded = false;
+        ExpandButton.Content = "⌄";
+        var fade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(130));
+        fade.Completed += (_, _) => Dashboard.Visibility = Visibility.Collapsed;
+        Dashboard.BeginAnimation(OpacityProperty, fade);
+        var height = new DoubleAnimation(660, 54, TimeSpan.FromMilliseconds(260)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut } };
+        BeginAnimation(HeightProperty, height);
+    }
+
+    private void UpdatePointerMode()
+    {
+        if (_handle == IntPtr.Zero || _expanded) return;
+        GetCursorPos(out POINT p);
+        GetWindowRect(_handle, out RECT r);
+        bool inside = p.X >= r.Left && p.X <= r.Right && p.Y >= r.Top && p.Y <= r.Bottom;
+        bool onExpand = inside && p.X >= r.Right - 54 && p.Y <= r.Top + 54;
+        bool shouldPass = inside && !onExpand;
+        if (shouldPass != _passThrough)
+        {
+            _passThrough = shouldPass;
+            ApplyTransparentStyle(shouldPass);
+        }
+        IslandShell.Opacity = shouldPass ? 0.62 : 1.0;
+    }
+
+    private void ApplyTransparentStyle(bool transparent)
+    {
+        int style = GetWindowLong(_handle, GwlExStyle);
+        style = transparent ? style | WsExTransparent : style & ~WsExTransparent;
+        SetWindowLong(_handle, GwlExStyle, style);
+    }
+
+    private void Nav_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button) return;
+        HomePage.Visibility = Visibility.Collapsed;
+        SystemPage.Visibility = Visibility.Collapsed;
+        NotesPage.Visibility = Visibility.Collapsed;
+        SettingsPage.Visibility = Visibility.Collapsed;
+        switch (button.Tag?.ToString())
+        {
+            case "home": HomePage.Visibility = Visibility.Visible; break;
+            case "system": SystemPage.Visibility = Visibility.Visible; UpdateSystemInfo(); break;
+            case "notes": NotesPage.Visibility = Visibility.Visible; break;
+            case "settings": SettingsPage.Visibility = Visibility.Visible; break;
+        }
+    }
+
+    private void SaveNote_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            string folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "NexusIsland");
+            Directory.CreateDirectory(folder);
+            File.WriteAllText(Path.Combine(folder, "note.txt"), NotesBox.Text);
+            NoteStatusText.Text = "Сохранено на этом компьютере.";
+        }
+        catch (Exception ex) { NoteStatusText.Text = "Не удалось сохранить: " + ex.Message; }
+    }
+
+    private void LoadNote()
+    {
+        string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "NexusIsland", "note.txt");
+        if (File.Exists(path)) NotesBox.Text = File.ReadAllText(path);
+    }
+
+    private void Refresh_Click(object sender, RoutedEventArgs e) => UpdateSystemInfo();
+
+    private void UpdateSystemInfo()
+    {
+        try
+        {
+            GetSystemTimes(out FILETIME idle, out FILETIME kernel, out FILETIME user);
+            ulong i = ToUInt64(idle), k = ToUInt64(kernel), u = ToUInt64(user);
+            if (_lastKernel != 0)
+            {
+                ulong total = (k - _lastKernel) + (u - _lastUser);
+                ulong busy = total > (i - _lastIdle) ? total - (i - _lastIdle) : 0;
+                _cpuUsage = total == 0 ? 0 : busy * 100.0 / total;
+            }
+            _lastIdle = i; _lastKernel = k; _lastUser = u;
+            MEMORYSTATUSEX mem = new();
+            if (GlobalMemoryStatusEx(ref mem))
+            {
+                double used = (mem.TotalPhys - mem.AvailPhys) / 1024d / 1024 / 1024;
+                double total = mem.TotalPhys / 1024d / 1024 / 1024;
+                CpuText.Text = $"{_cpuUsage:0}%";
+                RamText.Text = $"{used:0.0}";
+                RamSubText.Text = $"из {total:0.0} ГБ";
+                SystemDetailsText.Text = $"Процессор: {_cpuUsage:0.0}% загрузки\nОперативная память: {used:0.00} из {total:0.00} ГБ ({mem.MemoryLoad}%)\nОперационная система: Windows {Environment.OSVersion.Version}\nИмя компьютера: {Environment.MachineName}\nАрхитектура: { (Environment.Is64BitOperatingSystem ? "64-bit" : "32-bit") }";
+            }
+            SYSTEM_POWER_STATUS power = new();
+            if (GetSystemPowerStatus(out power) && power.BatteryLifePercent <= 100)
+            {
+                BatteryText.Text = power.BatteryLifePercent + "%";
+                BatterySubText.Text = power.ACLineStatus == 1 ? "подключено питание" : "от батареи";
+            }
+            else { BatteryText.Text = "—"; BatterySubText.Text = "нет батареи"; }
+        }
+        catch { CpuText.Text = "—"; RamText.Text = "—"; BatteryText.Text = "—"; }
+    }
+
+    private static ulong ToUInt64(FILETIME value) => ((ulong)value.dwHighDateTime << 32) | value.dwLowDateTime;
+
+    [StructLayout(LayoutKind.Sequential)] private struct POINT { public int X; public int Y; }
+    [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)] private struct FILETIME { public uint dwLowDateTime, dwHighDateTime; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)] private class MEMORYSTATUSEX
+    {
+        public uint dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+        public uint MemoryLoad; public ulong TotalPhys, AvailPhys, TotalPageFile, AvailPageFile, TotalVirtual, AvailVirtual, AvailExtendedVirtual;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct SYSTEM_POWER_STATUS { public byte ACLineStatus, BatteryFlag, BatteryLifePercent, SystemStatusFlag; public uint BatteryLifeTime, BatteryFullLifeTime; }
+
+    [DllImport("user32.dll")] private static extern bool GetCursorPos(out POINT point);
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll")] private static extern IntPtr GetKeyboardLayout(uint threadId);
+    [DllImport("kernel32.dll")] private static extern bool GetSystemTimes(out FILETIME idle, out FILETIME kernel, out FILETIME user);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX buffer);
+    [DllImport("kernel32.dll")] private static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS status);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] private static extern int GetWindowLong(IntPtr hWnd, int index);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW")] private static extern int SetWindowLong(IntPtr hWnd, int index, int value);
 }

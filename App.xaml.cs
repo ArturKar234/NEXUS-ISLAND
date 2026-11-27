@@ -1,1 +1,3 @@
-using System.Windows; namespace NexusIsland; public partial class App : Application { }
+using System.Windows;
+namespace NexusIsland;
+public partial class App : Application { }
